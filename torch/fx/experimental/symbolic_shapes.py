@@ -5926,6 +5926,8 @@ class ShapeEnv:
                 attrs, _ = t.__tensor_flatten__()
                 for attr in attrs:
                     inner_t = getattr(t, attr)
+                    if not isinstance(inner_t, torch.Tensor):
+                        continue
                     inner_context = context.inner_contexts[attr]
                     sources_tensors_constraints.append(
                         (

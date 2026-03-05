@@ -2494,6 +2494,15 @@ class VariableBuilder:
             attrs, _ = value.__tensor_flatten__()
             for attr in attrs:
                 inner_value = getattr(value, attr)
+                if not isinstance(
+                    inner_value, torch.Tensor
+                ) and not is_opaque_reference_type(type(inner_value)):
+                    raise RuntimeError(
+                        f"{type(inner_value).__name__!r} found in tensor attrs of "
+                        f"{type(value).__name__}.__tensor_flatten__(). "
+                        "Only tensors and reference-type opaques are allowed "
+                        "in tensor attrs."
+                    )
                 inner_source = AttrSource(self.source, attr)
                 LazyVariableTracker.realize_all(
                     VariableBuilder(self.tx, inner_source)(inner_value)
@@ -3697,10 +3706,12 @@ def _automatic_dynamic(
         inner_contexts = {}  # mapping from attr -> symbolic context
         attrs, _ = type(e).__tensor_flatten__(e)
         for attr in attrs:
-            inner_tensor = getattr(e, attr)
+            inner_value = getattr(e, attr)
+            if not isinstance(inner_value, torch.Tensor):
+                continue
             inner_source = AttrSource(source, attr)
             inner_contexts[attr] = _automatic_dynamic(
-                inner_tensor, tx, inner_source, static_shapes
+                inner_value, tx, inner_source, static_shapes
             )
 
         return SubclassSymbolicContext(
