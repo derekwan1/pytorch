@@ -15838,6 +15838,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             out2 = run_session(100, 16, 64, self.device)
             self.assertEqual(out2.device.type, self.device)
 
+    def test_half_constant(self):
+        for dtype in [torch.float16, torch.bfloat16]:
+            if not self.is_dtype_supported(dtype):
+                continue
+            self.common(
+                lambda x: x + 1.0,
+                (make_tensor(1024, dtype=dtype, device=self.device),),
+                check_lowp=False,
+            )
+
     def test_half_reduction(self):
         for dtype in [torch.float16, torch.bfloat16]:
             if not self.is_dtype_supported(dtype):
