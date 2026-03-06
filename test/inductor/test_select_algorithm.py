@@ -25,6 +25,7 @@ from torch._inductor.ir import FixedLayout
 from torch._inductor.kernel_inputs import KernelInputs
 from torch._inductor.select_algorithm import (
     autotune_select_algorithm,
+    ExternalTritonTemplateKernel,
     ExternKernelChoice,
     TritonTemplate,
     TritonTemplateKernel,
@@ -897,6 +898,134 @@ class TestTemplateRender(TestCase):
             FileCheck().check("triton_meta=").check(str(custom_triton_meta)).run(
                 kernels[0]
             )
+
+    @requires_gpu()
+    @requires_triton()
+    @config.patch(cuda_backend="triton")
+    def test_external_template_epilogue_fusion(self):
+        """
+        Tests epilogue fusion through the ExternalTritonTemplateKernel path.
+
+        Creates a mock external template buffer (element-wise add) with a
+        fuse() implementation that produces Triton source containing
+        _STORE_OUTPUT_0.  Verifies that relu gets fused into the template
+        kernel via the hook mechanism.
+        """
+        import torch._inductor.ir as ir
+        from torch._inductor.ir import (
+            OrderedSet,
+            TemplateFusionOutput,
+            TemplateFusionSpec,
+        )
+        from torch._inductor.utils import Placeholder, run_and_get_code
+
+        XBLOCK = 128
+
+        class _MockExternalTemplateBuffer(ir.TemplateBuffer):
+            def __init__(self, layout, inputs):
+                def _make_kernel_render(out_node, hint_override=None):
+                    return ExternalTritonTemplateKernel(self), lambda: None
+
+                super().__init__(
+                    layout,
+                    inputs,
+                    _make_kernel_render,
+                    named_inputs={"A": inputs[0], "B": inputs[1]},
+                )
+                self.epilogue_fusable_outputs = {self.name: "result"}
+
+            def fuse(self, spec: TemplateFusionSpec) -> TemplateFusionOutput:
+                call_args = [
+                    self.inputs[0].get_name(),
+                    self.inputs[1].get_name(),
+                ]
+
+                removed_buffers: OrderedSet[str] = OrderedSet()
+                # Determine output parameter: use the epilogue's store
+                # target if available (the name the hook code references).
+                out_param = "result"
+                out_arg = self.name
+                if spec.epilogue_specs:
+                    epi = spec.epilogue_specs[0]
+                    if epi.store_target is not None and epi.store_target_param:
+                        out_param = epi.store_target_param
+                        out_arg = epi.store_target
+                        if epi.can_remove_output:
+                            removed_buffers.add(epi.kernel_output_buf)
+
+                call_args.append(out_arg)
+                numel = self.get_size()[0]
+                call_args.append(str(numel))
+
+                # Build source: inner @triton.jit kernel + outer Python
+                # wrapper.  The outer function uses Placeholder.KERNEL_NAME
+                # so define_kernel can substitute the real name.
+                kn = str(Placeholder.KERNEL_NAME)
+                source = (
+                    "import triton\n"
+                    "import triton.language as tl\n"
+                    "import torch\n"
+                    "from torch._inductor.runtime import triton_helpers\n"
+                    "\n"
+                    "@triton.jit\n"
+                    f"def _mock_inner_add(A, B, {out_param},"
+                    " numel, XBLOCK: tl.constexpr):\n"
+                    "    xoffset = tl.program_id(0) * XBLOCK\n"
+                    "    xindex = xoffset + tl.arange(0, XBLOCK)\n"
+                    "    xmask = xindex < numel\n"
+                    "    a = tl.load(A + xindex, mask=xmask)\n"
+                    "    b = tl.load(B + xindex, mask=xmask)\n"
+                    "    _kernel_val_0 = a + b\n"
+                    "    x_epilogue0_0 = xindex\n"
+                    "    _tile_mask_0 = xmask\n"
+                    "    _STORE_OUTPUT_0\n"
+                    "\n"
+                    f"def {kn}(A, B, {out_param}, numel):\n"
+                    f"    grid = ((numel + {XBLOCK} - 1) // {XBLOCK},)\n"
+                    f"    _mock_inner_add[grid]("
+                    f"A, B, {out_param}, numel, XBLOCK={XBLOCK})\n"
+                    f"    return {out_param}\n"
+                )
+
+                return TemplateFusionOutput(
+                    source=source,
+                    call_args=call_args,
+                    call_preamble=[],
+                    removed_buffers=removed_buffers,
+                )
+
+        def add_override(a, b, alpha=None):
+            layout = FixedLayout(a.get_device(), a.get_dtype(), a.get_size())
+            a = ir.ExternKernel.require_stride1(ir.ExternKernel.realize_input(a))
+            b = ir.ExternKernel.require_stride1(ir.ExternKernel.realize_input(b))
+            return ir.TensorBox.create(_MockExternalTemplateBuffer(layout, [a, b]))
+
+        with patch_lowering(
+            {
+                torch.ops.aten.add.Tensor: (
+                    add_override,
+                    True,
+                    ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+                    False,
+                )
+            }
+        ):
+
+            @torch.compile
+            def f(a, b):
+                return torch.relu(a + b)
+
+            a = torch.randn(32, device=GPU_TYPE)
+            b = torch.randn(32, device=GPU_TYPE)
+
+            result, (code,) = run_and_get_code(f, a, b)
+            expected = torch.relu(a + b)
+            torch.testing.assert_close(result, expected)
+
+            # Verify epilogue fusion: the relu hook code should be
+            # fused into the template kernel source.
+            self.assertIn("_mock_inner_add", code)
+            self.assertIn("triton_helpers.maximum", code)
 
 
 if __name__ == "__main__":
